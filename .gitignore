@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+profile/*
+!profile/.gitkeep
+archive/*
+!archive/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Local conversation inventory; contains private ChatGPT URLs and titles.
+index.csv

@@ -1,0 +1,17 @@
+## Recommended workflow
+
+Open: *powershell*
+.\.venv\Scripts\python.exe archive.py login
+
+.\.venv\Scripts\python.exe archive.py index
+
+.\.venv\Scripts\python.exe archive.py capture
+
+.\.venv\Scripts\python.exe archive.py verify
+
+End.
+
+Then rerun:
+
+```powershell
+.\.venv\Scripts\python.exe archive.py index
