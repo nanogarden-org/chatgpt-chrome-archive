@@ -14,6 +14,7 @@ END_TEMPLATE = "<!-- CHATGPT_ARCHIVE_END ordinal={ordinal} -->"
 def render_markdown(extracted: dict, path: Path) -> None:
     lines = [
         "---",
+        f'provider: "{extracted.get("provider", "chatgpt")}"',
         f'conversation_id: "{extracted["conversation_id"]}"',
         f'title: {json.dumps(extracted["title"], ensure_ascii=False)}',
         f'url: "{extracted["url"]}"',

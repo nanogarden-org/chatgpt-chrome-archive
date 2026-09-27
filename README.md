@@ -1,12 +1,12 @@
-# ChatGPT Chrome Archive
+# AI Conversation Archive
 
-A small Chrome + Playwright tool for capturing ChatGPT conversations one at a time into Markdown, with indexing and verification.
+A small Chrome + Playwright tool for capturing conversations from ChatGPT, Google Gemini, Anthropic Claude, X Grok, and Perplexity one at a time into Markdown, with indexing and verification.
 
 ## What it does
 
 - Uses real Google Chrome through Playwright.
-- Keeps a dedicated persistent Chrome profile in `./profile/`.
-- Lets you log into ChatGPT normally once.
+- Keeps one dedicated persistent Chrome profile in `./profile/` for all providers.
+- Uses one persistent Chrome profile for all providers. Log into each service once in the opened Chrome window and let Chrome Password Manager save/autofill the account on later backups.
 - Discovers conversation links visible in the sidebar and adds them to `index.csv`.
 - Opens chats one at a time.
 - Scrolls the conversation toward the beginning until the message count stabilizes.
@@ -44,9 +44,11 @@ GUI dependencies are required; it uses Python's built-in Tkinter, like YT Whispe
 
 1. Click **1. Log In**, sign in in Chrome, then click **Finish Login** in the GUI.
 2. Click **2. Refresh Chat Index** to discover conversations.
-3. Choose **All indexed chats** or **Single conversation URL**, then click
+3. Choose a provider in the platform dropdown. Then choose **All indexed
+   chats for selected platform** or **Single conversation URL**, and click
    **3. Start Capture**. Verified chats are skipped in batch mode by default.
-4. Click **4. Verify Archive** to re-audit saved conversations locally.
+4. Click **4. Verify Archive** to re-audit saved conversations for the selected
+   platform locally.
 
 Search the conversation list to find a chat. Selecting a row fills the URL field
 and shows capture errors, if present. Double-click a row or use **Open Markdown**
@@ -60,8 +62,25 @@ The live log and per-conversation statuses report results; a finished process
 does not mean every conversation passed verification.
 
 The GUI uses the same `archive/`, `profile/`, `index.csv`, and `logs/` as the CLI.
+
+The viewer and command output identify the provider for every capture and
+validation event. The conversation table can be filtered by platform, and
+the **Open Ledgers** button opens durable per-provider capture ledgers under
+`ledger/`. Each ledger retains the conversation URL, title, capture and
+verification status, message count, stream hash, archive path, and whether
+the working copy is still present. The tool does not delete captures or mark
+backups automatically; after you independently confirm a backup, the ledger
+is the place to retain the capture record when the local working folder is
+removed.
 Run only one GUI or CLI operation at a time because they share this profile and
 index. The command-line workflow below remains available.
+
+The platform selection applies to batch capture and validation. A deliberate
+whole-archive validation is available from the CLI:
+
+```powershell
+.\.venv\Scripts\python.exe archive.py --provider chatgpt verify --all-providers
+```
 
 Close any Chrome window that is using this tool's dedicated `profile/` directory.
 
@@ -120,6 +139,35 @@ For each conversation:
 .\.venv\Scripts\python.exe archive.py capture-url "https://chatgpt.com/c/CONVERSATION-ID"
 ```
 
+## Other providers
+
+The same workflow is supported for Gemini, Claude, Grok, and Perplexity. Choose a provider in the GUI, or pass it before the command in the CLI:
+
+```powershell
+.\.venv\Scripts\python.exe archive.py --provider gemini login
+.\.venv\Scripts\python.exe archive.py --provider gemini index
+.\.venv\Scripts\python.exe archive.py add "https://gemini.google.com/app/CONVERSATION-ID"
+.\.venv\Scripts\python.exe archive.py capture-url "https://claude.ai/chat/CONVERSATION-ID"
+.\.venv\Scripts\python.exe archive.py capture-url "https://grok.com/c/CONVERSATION-ID"
+.\.venv\Scripts\python.exe archive.py capture-url "https://www.perplexity.ai/search/THREAD-ID"
+```
+
+`capture-url` infers its provider from the hostname. Provider captures are stored under `archive/<provider>/<conversation-id>/`; existing ChatGPT captures stay in the original `archive/<conversation-id>/` layout. Each capture preserves the browser-rendered HTML, normalized message JSON, Markdown, asset references, and verification metadata. Protected binary attachments are referenced but are not downloaded automatically.
+
+### Login and saved passwords
+
+The tool deliberately does not import or parse a password CSV, and it never stores credentials in the archive. Keep `Chrome Passwords.csv` private because it contains plaintext passwords. If those credentials are not already in Chrome Password Manager, import the CSV through Chrome's own Password Manager UI into the same profile used by this tool, then run:
+
+```powershell
+.\.venv\Scripts\python.exe archive.py --provider gemini login
+```
+
+Chrome may autofill the saved username and password. If it asks for a password-manager confirmation, complete that in Chrome. The tool pauses until you press Enter after the provider account is visibly logged in. Grok's login command also clicks its initial visible `Sign in`/`Log in` gate when present; choose the Google account and complete any validation yourself. Repeat the one-time login flow for Claude, Grok, and Perplexity; later runs reuse the persistent profile.
+
+Do not place the CSV in the project directory or commit it to source control. If you previously used the provider-specific profile folders created by an earlier version, the current release intentionally uses the root `profile/` directory so all saved credentials and sessions are available together; the old folders can be left untouched until you confirm the new profile works.
+
+The non-ChatGPT adapters use conservative DOM heuristics because these interfaces change frequently. If a provider reports zero messages or an unexpected role/order, inspect its saved HTML and update only `providers.py` or `provider_capture.py`; a partial capture must not be treated as complete.
+
 ## Audit the archive again
 
 ```powershell
@@ -127,6 +175,15 @@ For each conversation:
 ```
 
 This re-checks all local conversation folders without visiting ChatGPT.
+
+To rebuild the provider ledgers from the local archive folders:
+
+```powershell
+.\.venv\Scripts\python.exe archive.py ledger
+```
+
+This writes one CSV per platform, such as `ledger/chatgpt.csv`,
+`ledger/gemini.csv`, and `ledger/claude.csv`. The command is safe to repeat.
 
 ## Output structure
 

@@ -18,8 +18,9 @@ ROOT = Path(__file__).resolve().parent
 def validate_url(value):
     value = value.strip()
     p = urlparse(value)
-    if p.scheme != 'https' or p.netloc not in ('chatgpt.com', 'chat.openai.com') or not re.fullmatch(r'/c/[A-Za-z0-9_-]+/?', p.path):
-        raise ValueError('Enter a conversation URL: https://chatgpt.com/c/conversation-id')
+    allowed = ('chatgpt.com', 'chat.openai.com', 'gemini.google.com', 'claude.ai', 'grok.com', 'x.com', 'perplexity.ai', 'www.perplexity.ai')
+    if p.scheme != 'https' or p.netloc not in allowed or len(p.path.strip('/')) < 3:
+        raise ValueError('Enter an HTTPS conversation URL from ChatGPT, Gemini, Claude, Grok, or Perplexity.')
     return value
 
 
@@ -32,6 +33,7 @@ def worker():
     p.add_argument('--stable-passes', type=int, default=10)
     p.add_argument('--retry-verified', action='store_true')
     p.add_argument('--stop-on-error', action='store_true')
+    p.add_argument('--provider', choices=['chatgpt', 'gemini', 'claude', 'grok', 'perplexity'], default='chatgpt')
     args = p.parse_args(sys.argv[2:])
     args.stop_event = threading.Event()
     if args.command != 'login':
@@ -62,6 +64,7 @@ class ArchiveGUI(tk.Tk):
         self.maximum = tk.StringVar(value='400')
         self.stable = tk.StringVar(value='10')
         self.search = tk.StringVar()
+        self.filter_provider = tk.StringVar(value='all')
         self.status = tk.StringVar(value='Ready')
         self.summary = tk.StringVar()
         self.detail = tk.StringVar(value='Select a conversation to see capture details.')
@@ -81,13 +84,16 @@ class ArchiveGUI(tk.Tk):
     def build_ui(self):
         root = ttk.Frame(self, padding=14)
         root.pack(fill='both', expand=True)
-        ttk.Label(root, text='ChatGPT Archive', font=('Segoe UI', 18, 'bold')).pack(anchor='w')
-        ttk.Label(root, text='Local Chrome conversation archive — no terminal required once launched').pack(anchor='w', pady=(0, 12))
+        ttk.Label(root, text='AI Conversation Archive', font=('Segoe UI', 18, 'bold')).pack(anchor='w')
+        ttk.Label(root, text='Local Chrome capture for ChatGPT, Gemini, Claude, Grok, and Perplexity').pack(anchor='w', pady=(0, 12))
         setup = ttk.LabelFrame(root, text='Setup & discovery', padding=10)
         setup.pack(fill='x', pady=(0, 10))
         row = ttk.Frame(setup)
         row.pack(fill='x')
         self.button(row, '1. Log In', lambda: self.start('login'))
+        ttk.Label(row, text='Provider:').pack(side='left', padx=(14, 4))
+        self.provider = tk.StringVar(value='chatgpt')
+        ttk.Combobox(row, textvariable=self.provider, values=['chatgpt', 'gemini', 'claude', 'grok', 'perplexity'], state='readonly', width=14).pack(side='left')
         self.login_done = self.button(row, 'Finish Login', self.finish_login, False)
         self.login_done.configure(state='disabled')
         self.button(row, '2. Refresh Chat Index', lambda: self.start('index'))
@@ -99,11 +105,11 @@ class ArchiveGUI(tk.Tk):
         source.pack(fill='x', pady=(0, 10))
         row = ttk.Frame(source)
         row.pack(fill='x', pady=(0, 8))
-        for label, value in [('All indexed chats', 'all'), ('Single conversation URL', 'url')]:
+        for label, value in [('All indexed chats for selected platform', 'all'), ('Single conversation URL', 'url')]:
             ttk.Radiobutton(row, text=label, value=value, variable=self.mode).pack(side='left', padx=(0, 16))
         row = ttk.Frame(source)
         row.pack(fill='x')
-        ttk.Label(row, text='ChatGPT URL:', width=14).pack(side='left')
+        ttk.Label(row, text='Conversation URL:', width=14).pack(side='left')
         ttk.Entry(row, textvariable=self.url).pack(side='left', fill='x', expand=True, padx=(0, 8))
         self.button(row, 'Add to Index', lambda: self.start('add'))
         row = ttk.Frame(source)
@@ -118,6 +124,7 @@ class ArchiveGUI(tk.Tk):
         self.stop_button.configure(state='disabled')
         self.button(row, '4. Verify Archive', lambda: self.start('verify'))
         self.button(row, 'Open Archive Folder', lambda: self.open_path(ROOT / 'archive'), False)
+        self.button(row, 'Open Ledgers', lambda: self.open_path(ROOT / 'ledger'), False)
         ttk.Label(row, textvariable=self.status).pack(side='right')
         self.progress = ttk.Progressbar(root, mode='indeterminate')
         self.progress.pack(fill='x', pady=(0, 8))
@@ -127,13 +134,17 @@ class ArchiveGUI(tk.Tk):
         row.pack(fill='x', pady=(0, 6))
         ttk.Label(row, text='Search:').pack(side='left', padx=(0, 6))
         ttk.Entry(row, textvariable=self.search, width=25).pack(side='left')
+        ttk.Label(row, text='Platform:').pack(side='left', padx=(12, 4))
+        platform_filter = ttk.Combobox(row, textvariable=self.filter_provider, values=['all', 'chatgpt', 'gemini', 'claude', 'grok', 'perplexity'], state='readonly', width=12)
+        platform_filter.pack(side='left')
+        platform_filter.bind('<<ComboboxSelected>>', lambda _: self.populate())
         self.button(row, 'Reload List', self.refresh)
         self.button(row, 'Open Markdown', self.open_selected, False)
         ttk.Label(row, textvariable=self.summary).pack(side='right')
         table = ttk.Frame(box)
         table.pack(fill='both', expand=True)
-        self.tree = ttk.Treeview(table, columns=('title', 'status', 'messages', 'date'), show='headings', height=7, selectmode='browse')
-        for key, title, width in [('title', 'Conversation', 440), ('status', 'Status', 90), ('messages', 'Messages', 75), ('date', 'Captured (UTC)', 155)]:
+        self.tree = ttk.Treeview(table, columns=('provider', 'title', 'status', 'messages', 'date'), show='headings', height=10, selectmode='browse')
+        for key, title, width in [('provider', 'Platform', 90), ('title', 'Conversation', 370), ('status', 'Status', 90), ('messages', 'Messages', 75), ('date', 'Captured (UTC)', 155)]:
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, minwidth=60, stretch=key == 'title')
         self.tree.pack(side='left', fill='both', expand=True)
@@ -146,7 +157,7 @@ class ArchiveGUI(tk.Tk):
         self.tree.bind('<Double-1>', lambda _: self.open_selected())
         ttk.Label(box, textvariable=self.detail, wraplength=880).pack(anchor='w', pady=(6, 0))
         box = ttk.LabelFrame(root, text='Live log', padding=6)
-        box.pack(fill='both', expand=True)
+        box.pack(fill='both', expand=False, pady=(0, 2))
         self.log = tk.Text(box, wrap='word', state='disabled', font=('Consolas', 10), height=9)
         self.log.pack(side='left', fill='both', expand=True)
         scroll = ttk.Scrollbar(box, orient='vertical', command=self.log.yview)
@@ -164,14 +175,19 @@ class ArchiveGUI(tk.Tk):
     def populate(self):
         self.tree.delete(*self.tree.get_children())
         query = self.search.get().lower().strip()
+        selected_provider = self.filter_provider.get()
         for i, row in enumerate(self.rows):
+            provider = row.get('provider') or 'chatgpt'
+            if selected_provider != 'all' and provider != selected_provider:
+                continue
             if query and query not in ' '.join(str(v) for v in row.values()).lower():
                 continue
             status = row.get('status') or 'pending'
-            self.tree.insert('', 'end', iid=str(i), values=(row.get('title') or row.get('conversation_id'), status, row.get('message_count', ''), row.get('captured_at', '')[:19].replace('T', ' ')), tags=(status,))
-        verified = sum(r.get('status') == 'verified' for r in self.rows)
-        failed = sum(r.get('status') == 'failed' for r in self.rows)
-        self.summary.set(f'{len(self.rows)} total · {verified} verified · {failed} failed')
+            self.tree.insert('', 'end', iid=str(i), values=(provider, row.get('title') or row.get('conversation_id'), status, row.get('message_count', ''), row.get('captured_at', '')[:19].replace('T', ' ')), tags=(status,))
+        visible = [r for r in self.rows if selected_provider == 'all' or (r.get('provider') or 'chatgpt') == selected_provider]
+        verified = sum(r.get('status') == 'verified' for r in visible)
+        failed = sum(r.get('status') == 'failed' for r in visible)
+        self.summary.set(f'{len(visible)} {selected_provider} · {verified} verified · {failed} failed')
 
     def selected(self):
         selected = self.tree.selection()
@@ -181,15 +197,18 @@ class ArchiveGUI(tk.Tk):
         row = self.selected()
         if row:
             self.url.set(row.get('url', ''))
-            self.detail.set((row.get('error') or row.get('url') or '')[:450])
+            provider = row.get('provider') or 'chatgpt'
+            self.detail.set(f'[{provider.upper()}] ' + (row.get('error') or row.get('url') or '')[:430])
 
     def open_selected(self):
         row = self.selected()
         if not row:
             messagebox.showinfo('Choose a conversation', 'Select a conversation in the list first.')
             return
-        folder = (ROOT / 'archive' / row['conversation_id']).resolve()
-        if folder.parent != (ROOT / 'archive').resolve():
+        provider = row.get('provider') or 'chatgpt'
+        folder = (ROOT / 'archive' / provider / row['conversation_id']).resolve() if provider != 'chatgpt' else (ROOT / 'archive' / row['conversation_id']).resolve()
+        archive_root = (ROOT / 'archive' / provider).resolve() if provider != 'chatgpt' else (ROOT / 'archive').resolve()
+        if folder.parent != archive_root:
             messagebox.showerror('Invalid archive path', 'The conversation ID is not a valid folder name.')
             return
         self.open_path(folder / 'conversation.md')
@@ -208,6 +227,7 @@ class ArchiveGUI(tk.Tk):
         if not python.exists():
             python = Path(sys.executable).with_name('python.exe')
         args = [str(python), '-u', str(Path(__file__).resolve()), '--worker', command]
+        args.extend(['--provider', self.provider.get()])
         if command in ('capture-url', 'add'):
             args.append(validate_url(self.url.get()))
         if command == 'index':
@@ -233,7 +253,8 @@ class ArchiveGUI(tk.Tk):
             replacing = command == 'capture' and self.retry.get()
             if command == 'capture-url':
                 cid = urlparse(args[-1]).path.rstrip('/').split('/')[-1]
-                replacing = (ROOT / 'archive' / cid / 'conversation.md').exists()
+                base = ROOT / 'archive' / self.provider.get() if self.provider.get() != 'chatgpt' else ROOT / 'archive'
+                replacing = (base / cid / 'conversation.md').exists()
             if replacing and not messagebox.askyesno('Replace existing captures', 'This will replace existing captures. Continue?'):
                 return
             env = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUNBUFFERED='1')

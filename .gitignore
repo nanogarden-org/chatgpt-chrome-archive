@@ -7,6 +7,10 @@ archive/*
 !archive/.gitkeep
 logs/*
 !logs/.gitkeep
+ledger/*
+!ledger/.gitkeep
+dist/*
+!dist/.gitkeep
 
 # Local conversation inventory; contains private ChatGPT URLs and titles.
 index.csv

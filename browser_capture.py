@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright, Page
 
 from dom_selectors import (
-    MESSAGE_ALL,
+    MESSAGE_READY,
     SIDEBAR_LINK_SELECTORS,
     SCROLLABLE_SELECTORS,
 )
+from providers import PROVIDERS, provider_for_url, conversation_id
+from provider_capture import capture_generic, index_provider
 from utils import (
     ARCHIVE_DIR,
     PROFILE_DIR,
@@ -26,9 +29,12 @@ log = logging.getLogger(__name__)
 CHATGPT_URL = "https://chatgpt.com/"
 
 
-async def launch():
+async def launch(provider_key: str = "chatgpt"):
     pw = await async_playwright().start()
     context = await pw.chromium.launch_persistent_context(
+        # Keep one real Chrome profile for all providers. This preserves the
+        # user's saved-password database and cookies between provider runs;
+        # credentials are filled by Chrome/the user, never read by this tool.
         user_data_dir=str(PROFILE_DIR),
         channel="chrome",
         headless=False,
@@ -39,11 +45,28 @@ async def launch():
     return pw, context, page
 
 
-async def login() -> None:
-    pw, context, page = await launch()
+async def login(provider_key: str = "chatgpt") -> None:
+    provider = PROVIDERS[provider_key]
+    pw, context, page = await launch(provider_key)
     try:
-        await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60000)
-        print("\nChrome is open. Log into ChatGPT normally.")
+        await page.goto(provider.home, wait_until="domcontentloaded", timeout=60000)
+        if provider_key == "grok":
+            # Grok commonly shows a landing page with an explicit sign-in
+            # gate before presenting its Google account chooser. Click only a
+            # visible, semantically-labelled control; account selection and
+            # verification remain a user action.
+            for locator in (
+                page.get_by_role("button", name=re.compile(r"^(sign in|log in)$", re.I)),
+                page.get_by_role("link", name=re.compile(r"^(sign in|log in)$", re.I)),
+            ):
+                try:
+                    if await locator.first.is_visible(timeout=1500):
+                        await locator.first.click()
+                        await page.wait_for_timeout(1200)
+                        break
+                except Exception:
+                    continue
+        print(f"\nChrome is open. Log into {provider.label} normally.")
         print("When you can see your chats, return here and press Enter.\n")
         await asyncio.to_thread(input)
     finally:
@@ -72,7 +95,17 @@ async def find_sidebar_scroll_container(page: Page):
     return best
 
 
-async def index_sidebar(max_passes: int = 400, stable_passes: int = 10) -> list[dict]:
+async def index_sidebar(max_passes: int = 400, stable_passes: int = 10, provider_key: str = "chatgpt") -> list[dict]:
+    if provider_key != "chatgpt":
+        provider = PROVIDERS[provider_key]
+        pw, context, page = await launch(provider_key)
+        try:
+            await page.goto(provider.home, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(2500)
+            return await index_provider(page, provider, max_passes, stable_passes)
+        finally:
+            await context.close()
+            await pw.stop()
     pw, context, page = await launch()
     found: dict[str, dict] = {}
 
@@ -148,10 +181,10 @@ async def _find_conversation_scroll_target(page: Page) -> dict:
         """() => {
             const msgSel =
                 '[data-message-author-role="user"],' +
-                '[data-message-author-role="assistant"]';
+                '[data-message-author-role="assistant"],' +
+                'h4.sr-only';
 
             const candidates = [
-                document.scrollingElement,
                 ...document.querySelectorAll('*')
             ];
 
@@ -202,7 +235,10 @@ async def _find_conversation_scroll_target(page: Page) -> dict:
                 '1'
             );
 
-            return {kind: 'element'};
+            return {
+                kind: 'element',
+                reverse: getComputedStyle(best).flexDirection === 'column-reverse'
+            };
         }"""
     )
 
@@ -218,10 +254,14 @@ async def _scroll_metrics(page: Page, target: dict) -> dict:
 
                 if (!el) return null;
 
+                const height = el.scrollHeight;
+                const client = el.clientHeight;
+                const maxTop = Math.max(0, height - client);
+                const reverse = getComputedStyle(el).flexDirection === 'column-reverse';
                 return {
-                    top: el.scrollTop,
-                    height: el.scrollHeight,
-                    client: el.clientHeight
+                    top: reverse ? Math.max(0, Math.min(maxTop, maxTop + el.scrollTop)) : el.scrollTop,
+                    height,
+                    client
                 };
             }"""
         )
@@ -248,7 +288,12 @@ async def _set_scroll(page: Page, target: dict, top: float):
                         '[data-chat-archive-scroll-target="1"]'
                     );
 
-                if (el) el.scrollTop = top;
+                if (el) {
+                    const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+                    const reverse = getComputedStyle(el).flexDirection === 'column-reverse';
+                    const normalized = Math.max(0, Math.min(maxTop, top));
+                    el.scrollTop = reverse ? -(maxTop - normalized) : normalized;
+                }
             }""",
             top,
         )
@@ -267,12 +312,26 @@ async def _extract_dom_batch(page: Page) -> list[dict]:
     """
     return await page.evaluate(
         """() => {
-            const nodes = Array.from(
-                document.querySelectorAll(
-                    '[data-message-author-role="user"],' +
-                    '[data-message-author-role="assistant"]'
-                )
-            );
+            let nodes = Array.from(document.querySelectorAll(
+                '[data-message-author-role="user"],' +
+                '[data-message-author-role="assistant"]'
+            ));
+            let inferred = false;
+            if (!nodes.length) {
+                const labels = Array.from(document.querySelectorAll('h4.sr-only'))
+                    .filter(node => /^(you said|chatgpt said):$/i.test((node.innerText || '').trim()));
+                nodes = labels.map(node => node.parentElement).filter(Boolean);
+            }
+            if (!nodes.length) {
+                nodes = Array.from(document.querySelectorAll(
+                    '[data-testid^="conversation-turn-"], article'
+                )).filter(node => {
+                    const testid = node.getAttribute('data-testid') || '';
+                    return testid.startsWith('conversation-turn-') ||
+                        !node.closest('[data-testid^="conversation-turn-"]');
+                });
+                inferred = true;
+            }
 
             function attrFromAncestors(node, name) {
                 let el = node;
@@ -292,16 +351,29 @@ async def _extract_dom_batch(page: Page) -> list[dict]:
                 return null;
             }
 
-            return nodes.map((node, localIndex) => {
-                const role =
+            const result = nodes.map((node, localIndex) => {
+                let role =
                     node.getAttribute(
                         'data-message-author-role'
                     ) || 'unknown';
 
-                const text =
+                const label = node.querySelector('h4.sr-only');
+                const labelText = (label?.innerText || '').trim();
+                if (/^you said:$/i.test(labelText)) role = 'user';
+                if (/^chatgpt said:$/i.test(labelText)) role = 'assistant';
+
+                if (role === 'unknown') {
+                    const attrs = [...node.attributes].map(a => `${a.name}=${a.value}`).join(' ').toLowerCase();
+                    if (/user|human|prompt/.test(attrs)) role = 'user';
+                    else if (/assistant|model|response|answer/.test(attrs)) role = 'assistant';
+                    else role = 'unknown';
+                }
+
+                let text =
                     node.innerText ||
                     node.textContent ||
                     '';
+                text = text.replace(/^(You said:|ChatGPT said:)\\s*/i, '');
 
                 const testid =
                     attrFromAncestors(
@@ -340,9 +412,25 @@ async def _extract_dom_batch(page: Page) -> list[dict]:
                     testid,
                     message_id: messageId,
                     turn_index: turnIndex,
-                    local_index: localIndex
+                    local_index: localIndex,
+                    role_inferred: inferred || role === 'unknown'
                 };
             });
+
+            // If the current DOM removed all role labels, preserve the visible
+            // turn order as a last-resort identity signal. The completeness
+            // gate will surface the inferred-role warning for manual review.
+            const unknown = result.filter(n => n.role === 'unknown');
+            if (unknown.length) {
+                result.forEach((n, i) => {
+                    if (n.role === 'unknown') {
+                        const stableIndex = n.turn_index !== null ? n.turn_index : i;
+                        n.role = stableIndex % 2 === 0 ? 'user' : 'assistant';
+                        n.role_inferred = true;
+                    }
+                });
+            }
+            return result;
         }"""
     )
 
@@ -391,12 +479,24 @@ async def _extract_assets_for_visible_messages(
     """
     raw = await page.evaluate(
         """() => {
-            const nodes = Array.from(
-                document.querySelectorAll(
-                    '[data-message-author-role="user"],' +
-                    '[data-message-author-role="assistant"]'
-                )
-            );
+            let nodes = Array.from(document.querySelectorAll(
+                '[data-message-author-role="user"],' +
+                '[data-message-author-role="assistant"]'
+            ));
+            if (!nodes.length) {
+                const labels = Array.from(document.querySelectorAll('h4.sr-only'))
+                    .filter(node => /^(you said|chatgpt said):$/i.test((node.innerText || '').trim()));
+                nodes = labels.map(node => node.parentElement).filter(Boolean);
+            }
+            if (!nodes.length) {
+                nodes = Array.from(document.querySelectorAll(
+                    '[data-testid^="conversation-turn-"], article'
+                )).filter(node => {
+                    const testid = node.getAttribute('data-testid') || '';
+                    return testid.startsWith('conversation-turn-') ||
+                        !node.closest('[data-testid^="conversation-turn-"]');
+                });
+            }
 
             function attrFromAncestors(node, name) {
                 let el = node;
@@ -417,15 +517,27 @@ async def _extract_assets_for_visible_messages(
             }
 
             return nodes.map(node => {
-                const role =
+                let role =
                     node.getAttribute(
                         'data-message-author-role'
                     ) || 'unknown';
 
-                const text =
+                const label = node.querySelector('h4.sr-only');
+                const labelText = (label?.innerText || '').trim();
+                if (/^you said:$/i.test(labelText)) role = 'user';
+                if (/^chatgpt said:$/i.test(labelText)) role = 'assistant';
+
+                if (role === 'unknown') {
+                    const attrs = [...node.attributes].map(a => `${a.name}=${a.value}`).join(' ').toLowerCase();
+                    if (/user|human|prompt/.test(attrs)) role = 'user';
+                    else if (/assistant|model|response|answer/.test(attrs)) role = 'assistant';
+                }
+
+                let text =
                     node.innerText ||
                     node.textContent ||
                     '';
+                text = text.replace(/^(You said:|ChatGPT said:)\\s*/i, '');
 
                 const testid =
                     attrFromAncestors(
@@ -519,7 +631,8 @@ async def _extract_assets_for_visible_messages(
                     testid,
                     message_id: messageId,
                     turn_index: turnIndex,
-                    assets
+                    assets,
+                    role_inferred: role === 'unknown'
                 };
             });
         }"""
@@ -849,6 +962,7 @@ async def harvest_entire_conversation(
         "harvested_messages": len(messages),
         "all_have_turn_index": all_have_turn_index,
         "unknown_identity_count": len(unknown),
+        "inferred_role_count": sum(1 for x in items if x.get("role_inferred")),
         "scroll_height_changes": height_changes,
         "max_steps": max_steps,
         "warning": (
@@ -893,8 +1007,19 @@ async def get_title(
 
 
 async def capture_url(
-    url: str
+    url: str,
+    provider_key: str | None = None,
 ) -> dict:
+    provider = provider_for_url(url)
+    if provider.key != "chatgpt":
+        out = ARCHIVE_DIR / provider.key / conversation_id(url, provider)
+        out.mkdir(parents=True, exist_ok=True)
+        pw, context, page = await launch(provider.key)
+        try:
+            return await capture_generic(page, provider, url, out)
+        finally:
+            await context.close()
+            await pw.stop()
     cid = conversation_id_from_url(
         url
     )
@@ -909,7 +1034,8 @@ async def capture_url(
 
     try:
         log.info(
-            "Opening %s",
+            "[%s] Opening %s",
+            provider.key,
             url
         )
 
@@ -921,7 +1047,7 @@ async def capture_url(
 
         try:
             await page.wait_for_selector(
-                MESSAGE_ALL,
+                MESSAGE_READY,
                 timeout=60000,
             )
 
@@ -980,6 +1106,7 @@ async def capture_url(
         )
 
         extracted = {
+            "provider": "chatgpt",
             "conversation_id": cid,
             "url": url,
             "title": title,
