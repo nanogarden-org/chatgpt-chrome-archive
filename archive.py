@@ -82,6 +82,9 @@ def apply_completeness_gate(extracted: dict, verification: dict) -> dict:
     max_steps = harvest.get("max_steps")
     steps = harvest.get("harvest_steps")
 
+    if provider_name(extracted.get("provider")) != "chatgpt" and harvest.get("ordering_confirmed") is not True:
+        problems.append("COMPLETENESS GATE: generic capture order is unconfirmed; inspect capture-observations.jsonl")
+
     if not reached_top:
         problems.append(
             "COMPLETENESS GATE: browser traversal did not reach the top of the conversation"

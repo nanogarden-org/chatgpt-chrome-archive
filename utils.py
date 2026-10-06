@@ -92,9 +92,9 @@ def write_index(rows: list[dict]) -> None:
 
 def upsert_index(records: list[dict]) -> None:
     rows = read_index()
-    by_id = {r["conversation_id"]: r for r in rows if r.get("conversation_id")}
+    by_id = {(provider_key(r.get("provider")), r["conversation_id"]): r for r in rows if r.get("conversation_id")}
     for rec in records:
-        cid = rec["conversation_id"]
+        cid = (provider_key(rec.get("provider")), rec["conversation_id"])
         if cid in by_id:
             old = by_id[cid]
             for k, v in rec.items():
