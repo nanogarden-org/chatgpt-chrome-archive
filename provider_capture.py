@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
+
+from capture_order import CaptureOrder
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
@@ -18,6 +21,10 @@ async def _raw_messages(page: Page, provider: Provider) -> list[dict]:
     return await page.evaluate(
         """({selector, provider}) => {
           const nodes = [...document.querySelectorAll(selector)];
+          if (!window.__archiveCaptureNodes) {
+            window.__archiveCaptureNodes = {ids: new WeakMap(), next: 0};
+          }
+          const capture = window.__archiveCaptureNodes;
           return nodes.map((node, index) => {
             const attrs = [...node.attributes].map(a => `${a.name}=${a.value}`).join(' ').toLowerCase();
             const tag = node.tagName.toLowerCase();
@@ -34,7 +41,8 @@ async def _raw_messages(page: Page, provider: Provider) -> list[dict]:
               tag: el.tagName.toLowerCase(), label: (el.innerText || el.alt || '').trim(),
               href: el.getAttribute('href'), src: el.getAttribute('src'), alt: el.getAttribute('alt')
             })).filter(x => x.src || x.href);
-            return {role, text, message_id: id, local_index: index, assets};
+            if (!capture.ids.has(node)) capture.ids.set(node, ++capture.next);
+            return {role, text, message_id: id, capture_id: capture.ids.get(node), local_index: index, assets};
           });
         }""",
         {"selector": selector_csv(provider), "provider": provider.key},
@@ -43,16 +51,11 @@ async def _raw_messages(page: Page, provider: Provider) -> list[dict]:
 
 def _clean(raw: list[dict]) -> list[dict]:
     result = []
-    seen = set()
     for item in raw:
         text = normalize_text(item.get("text"))
         role = item.get("role")
         if not text or role == "unknown":
             continue
-        key = (role, text, item.get("message_id"))
-        if key in seen:
-            continue
-        seen.add(key)
         result.append({**item, "role": role, "text": text})
     return result
 
@@ -96,15 +99,20 @@ async def capture_generic(page: Page, provider: Provider, url: str, out: Path) -
     await page.wait_for_timeout(2500)
     initial = await page.content()
     (out / "capture-initial.html").write_text(initial, encoding="utf-8")
-    seen = {}
+    (out / "capture-observations.jsonl").write_text("", encoding="utf-8")
+    order = CaptureOrder()
+    seen = order.messages
     no_new = 0
     reached_top = False
     for step in range(1, 401):
-        batch = _clean(await _raw_messages(page, provider))
+        raw = await _raw_messages(page, provider)
+        with (out / "capture-observations.jsonl").open("a", encoding="utf-8") as observations:
+            observations.write(json.dumps({"step": step, "messages": raw}, ensure_ascii=False) + "\n")
+        if any(normalize_text(item.get("text")) and item.get("role") == "unknown" for item in raw):
+            order.problems.add("unrecognized message role")
+        batch = _clean(raw)
         before = len(seen)
-        for item in batch:
-            key = item.get("message_id") or f"{item['role']}|{item['text']}"
-            seen[key] = item
+        order.add(batch)
         no_new = 0 if len(seen) > before else no_new + 1
         top = await page.evaluate("() => (document.scrollingElement?.scrollTop || window.scrollY) <= 3")
         reached_top = reached_top or top
@@ -115,14 +123,15 @@ async def capture_generic(page: Page, provider: Provider, url: str, out: Path) -
     if not seen:
         raise RuntimeError(f"No {provider.label} messages were visible. Check login or provider adapter selectors.")
     messages = []
-    for ordinal, item in enumerate(seen.values(), 1):
-        messages.append({"ordinal": ordinal, "role": item["role"], "text": item["text"], "sha256": message_hash(item["role"], item["text"]), "assets": item.get("assets", []), "message_id": item.get("message_id")})
+    ordered = order.ordered()
+    for ordinal, item in enumerate(ordered, 1):
+        messages.append({"ordinal": ordinal, "role": item["role"], "text": item["text"], "sha256": message_hash(item["role"], item["text"]), "assets": item.get("assets", []), "message_id": item.get("message_id"), "capture_id": item.get("capture_id")})
     cid = conversation_id(url, provider)
     title = normalize_text(await page.title()) or cid
     final = await page.content()
     (out / "capture-final.html").write_text(final, encoding="utf-8")
     captured_at = datetime.now(timezone.utc).isoformat()
-    harvest = {"harvest_version": "provider-generic-v1", "harvest_steps": step, "reached_top": reached_top, "harvested_messages": len(messages), "max_steps": 400, "warning": "" if reached_top else "maximum harvest steps reached before top"}
+    harvest = {"harvest_version": "provider-generic-v2", "ordering_confirmed": not order.problems, "ordering_problems": sorted(order.problems), "harvest_steps": step, "reached_top": reached_top, "harvested_messages": len(messages), "max_steps": 400, "warning": "" if reached_top else "maximum harvest steps reached before top"}
     extracted = {"provider": provider.key, "conversation_id": cid, "url": url, "title": title, "captured_at": captured_at, "harvest": harvest, "message_count": len(messages), "stream_sha256": stream_hash(messages), "messages": messages}
     json_dump(out / "extracted.json", extracted)
     json_dump(out / "metadata.json", {k: extracted[k] for k in ("provider", "conversation_id", "url", "title", "captured_at", "message_count", "stream_sha256", "harvest")})

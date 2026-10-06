@@ -281,3 +281,9 @@ Then rerun:
 until no additional conversations are discovered.
 
 For irreplaceable chats, visually open a few long examples and compare the beginning and ending messages against the Markdown before trusting unattended capture.
+
+## Capture integrity checks
+
+Generic provider captures preserve separate DOM message instances even when their text is identical. Overlapping snapshots establish message order; disconnected snapshots, conflicting order, changed content, or unknown roles prevent a verified result. `capture-observations.jsonl` retains each raw snapshot for manual inspection. Replaced DOM nodes without provider message IDs may remain ambiguous. Reaching the top and matching Markdown hashes do not alone establish order or completeness. Legacy generic captures without ordering evidence require review.
+
+Conversation index identity includes the provider; an older row with no provider is treated as ChatGPT. Run synthetic checks with `python -m unittest discover -s tests -v`. CI runs on Windows and Linux with Python 3.11 and 3.12. Tests do not log in, browse live provider UIs, or establish the accuracy of their current selectors. Captures and raw snapshots contain conversation content; handle them with the same care as the archive.
